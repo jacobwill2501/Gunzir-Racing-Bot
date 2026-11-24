@@ -24,3 +24,8 @@ hs_err_pid*
 
 src/main/java/riotkey.txt
 src/main/java/discordkey.txt
+# Riot API analysis cache/output
+.riot_cache/
+graves_boots.csv
+graves_boots.txt
+__pycache__/
