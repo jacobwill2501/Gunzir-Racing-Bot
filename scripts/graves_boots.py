@@ -185,8 +185,19 @@ class RiotClient:
 # Item data
 # --------------------------------------------------------------------------- #
 
-def load_tier2_boots(cache_dir: Path) -> dict[int, str]:
-    """Tier-2 boots = Summoner's Rift items tagged Boots that build from Boots (1001)."""
+def is_legendary(item: dict) -> bool:
+    """A completed item: buyable on Summoner's Rift, builds into nothing, not boots,
+    consumable or trinket, and costs at least 1500 gold (which leaves out starters)."""
+    tags = set(item.get("tags", []))
+    gold = item.get("gold", {})
+    return (item.get("maps", {}).get("11", False) and not item.get("into")
+            and gold.get("purchasable", False) and gold.get("total", 0) >= 1500
+            and not tags & {"Boots", "Consumable", "Trinket"})
+
+
+def load_items(cache_dir: Path) -> tuple[dict[int, str], dict[int, str]]:
+    """(tier-2 boots, completed items) by id. Tier-2 boots are the Summoner's Rift items
+    tagged Boots that build straight from Boots (1001)."""
     try:
         version = requests.get("https://ddragon.leagueoflegends.com/api/versions.json", timeout=15).json()[0]
         cache = cache_dir / f"items_{version}.json"
@@ -196,23 +207,26 @@ def load_tier2_boots(cache_dir: Path) -> dict[int, str]:
             items = requests.get(
                 f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/item.json", timeout=30
             ).json()["data"]
+            cache_dir.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(items))
-        boots = {
-            int(item_id): item["name"]
-            for item_id, item in items.items()
-            if "Boots" in item.get("tags", [])
-            and "1001" in item.get("from", [])
-            and item.get("maps", {}).get("11", False)
-        }
-        if boots:
-            # Keep ids from older patches too, in case cached games predate an item change.
-            for item_id, name in FALLBACK_TIER2_BOOTS.items():
-                boots.setdefault(item_id, name)
-            print(f"Tier-2 boots from Data Dragon {version}: {', '.join(sorted(boots.values()))}")
-            return boots
     except (requests.RequestException, KeyError, ValueError, IndexError) as exc:
-        print(f"Could not load Data Dragon ({exc}); using built-in boots list", file=sys.stderr)
-    return dict(FALLBACK_TIER2_BOOTS)
+        cached = sorted(cache_dir.glob("items_*.json"))
+        if not cached:
+            sys.exit(f"Could not load Data Dragon item data ({exc}) and no cached copy exists.")
+        version, items = cached[-1].stem.removeprefix("items_"), json.loads(cached[-1].read_text())
+    boots = {
+        int(item_id): item["name"]
+        for item_id, item in items.items()
+        if "Boots" in item.get("tags", [])
+        and "1001" in item.get("from", [])
+        and item.get("maps", {}).get("11", False)
+    }
+    # Keep ids from older patches too, in case cached games predate an item change.
+    for item_id, name in FALLBACK_TIER2_BOOTS.items():
+        boots.setdefault(item_id, name)
+    legendaries = {int(i): item["name"] for i, item in items.items() if is_legendary(item)}
+    print(f"Data Dragon {version}: {len(boots)} tier-2 boots, {len(legendaries)} completed items")
+    return boots, legendaries
 
 
 # --------------------------------------------------------------------------- #
@@ -248,30 +262,62 @@ def find_graves_players(client: RiotClient, tiers: list[str], max_checks: int, w
     return candidates[:want]
 
 
-def first_tier2_boots(timeline: dict, participant_id: int, boots: dict[int, str]):
-    """Return (timestamp_ms, item_id) of the first tier-2 boots kept, or None."""
-    purchases: list[list] = []  # [timestamp, item_id], in order
+def ordinal(n: int) -> str:
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def build_order(timeline: dict, participant_id: int, boots: dict[int, str],
+                legendaries: dict[int, str]) -> dict:
+    """Walk one player's purchases in order (undos removed) and say where tier-2 boots
+    fall among completed items. boots_slot 1 = boots before any completed item,
+    2 = boots right after the first completed item, and so on."""
+    kept: list[tuple[int, int]] = []  # (timestamp, item_id) of tracked purchases, in order
     for frame in timeline["info"]["frames"]:
         for ev in frame.get("events", []):
             if ev.get("participantId") != participant_id:
                 continue
             etype = ev.get("type")
-            if etype == "ITEM_PURCHASED" and ev.get("itemId") in boots:
-                purchases.append([ev["timestamp"], ev["itemId"]])
-            elif etype == "ITEM_UNDO" and ev.get("beforeId") in boots:
-                # Undo of a boots purchase: drop the most recent matching purchase.
-                for j in range(len(purchases) - 1, -1, -1):
-                    if purchases[j][1] == ev["beforeId"]:
-                        purchases.pop(j)
+            if etype == "ITEM_PURCHASED" and (ev.get("itemId") in boots or ev.get("itemId") in legendaries):
+                kept.append((ev["timestamp"], ev["itemId"]))
+            elif etype == "ITEM_UNDO":
+                # An undo of a purchase: drop the most recent matching purchase.
+                for j in range(len(kept) - 1, -1, -1):
+                    if kept[j][1] == ev.get("beforeId"):
+                        kept.pop(j)
                         break
-    if not purchases:
-        return None
-    return purchases[0][0], purchases[0][1]
+    completed_before: list[str] = []
+    seen_legendary: set[int] = set()
+    boots_at = None
+    for ts, item_id in kept:
+        if item_id in boots:
+            boots_at = (ts, item_id)
+            break
+        if item_id not in seen_legendary:  # rebuying the same item (e.g. after selling) isn't a new slot
+            seen_legendary.add(item_id)
+            completed_before.append(legendaries[item_id])
+    total_completed = len({i for _, i in kept if i in legendaries})
+    if boots_at is None:
+        return {"boots_minute": None, "boots_item": "None", "boots_slot": None,
+                "boots_position": "Not built", "items_before": "", "completed_items": total_completed}
+    slot = len(completed_before) + 1
+    return {
+        "boots_minute": round(boots_at[0] / 60000, 2),
+        "boots_item": boots.get(boots_at[1], str(boots_at[1])),
+        "boots_slot": slot,
+        "boots_position": f"{ordinal(slot)} item",
+        "items_before": " > ".join(completed_before),
+        "completed_items": total_completed,
+    }
 
 
-def graves_row(client: RiotClient, mid: str, boots: dict[int, str]) -> list[dict]:
-    """Rows for every Graves in one match (empty if none, or a remake)."""
-    info = client.match(mid)["info"]
+def graves_row(client: "RiotClient | None", mid: str, boots: dict[int, str], legendaries: dict[int, str],
+               cache_dir: Path | None = None) -> list[dict]:
+    """Rows for every Graves in one match (empty if none, or a remake). With no client,
+    reads the match and timeline from cache_dir only."""
+    if client is None:
+        info = json.loads((cache_dir / "match" / f"{mid}.json").read_text())["info"]
+    else:
+        info = client.match(mid)["info"]
     if info.get("queueId") != RANKED_SOLO_QUEUE:
         return []
     duration_s = info.get("gameDuration", 0)
@@ -284,10 +330,16 @@ def graves_row(client: RiotClient, mid: str, boots: dict[int, str]) -> list[dict
     # Skip remakes.
     if duration_s < 300 or any(p.get("gameEndedInEarlySurrender") for p in info["participants"]):
         return []
-    timeline = client.timeline(mid)
+    if client is None:
+        tl_path = cache_dir / "timeline" / f"{mid}.json"
+        if not tl_path.exists():
+            return []
+        timeline = json.loads(tl_path.read_text())
+    else:
+        timeline = client.timeline(mid)
     rows = []
     for g in graves:
-        found = first_tier2_boots(timeline, g["participantId"], boots)
+        order = build_order(timeline, g["participantId"], boots, legendaries)
         rows.append({
             "match_id": mid,
             "game_version": info.get("gameVersion", ""),
@@ -297,14 +349,14 @@ def graves_row(client: RiotClient, mid: str, boots: dict[int, str]) -> list[dict
             "position": g.get("teamPosition", ""),
             "win": bool(g["win"]),
             "game_minutes": round(duration_s / 60, 2),
-            "boots_minute": round(found[0] / 60000, 2) if found else None,
-            "boots_item": boots.get(found[1], str(found[1])) if found else "None",
+            **order,
         })
     return rows
 
 
 def collect(client: RiotClient, players: list[dict], matches_per_player: int, days: int,
-            boots: dict[int, str], max_games: int, give_up_after: int) -> list[dict]:
+            boots: dict[int, str], legendaries: dict[int, str], max_games: int,
+            give_up_after: int) -> list[dict]:
     """Scan each seed player's recent ranked games. A seed with no Graves game in their
     first `give_up_after` matches is skipped, since they aren't playing him now."""
     start_time = int(time.time() - days * 86400) if days else None
@@ -325,11 +377,20 @@ def collect(client: RiotClient, players: list[dict], matches_per_player: int, da
                 continue
             seen.add(mid)
             scanned += 1
-            new_rows = graves_row(client, mid, boots)
+            new_rows = graves_row(client, mid, boots, legendaries)
             rows.extend(new_rows)
             seed_graves += any(r["puuid"] == p["puuid"] for r in new_rows)
         print(f"  player {n}/{len(players)}: {seed_graves} own Graves games | total {len(rows)} Graves games, "
               f"{scanned} matches scanned, {client.calls_made} API calls")
+    return rows
+
+
+def collect_from_cache(cache_dir: Path, boots: dict[int, str], legendaries: dict[int, str]) -> list[dict]:
+    """Every cached ranked match with a Graves and a cached timeline. No API calls."""
+    rows = []
+    for path in sorted((cache_dir / "match").glob("*.json")):
+        rows.extend(graves_row(None, path.stem, boots, legendaries, cache_dir))
+    print(f"{len(rows)} Graves games in the cache")
     return rows
 
 
@@ -372,6 +433,20 @@ def report(rows: list[dict], bucket_minutes: int) -> str:
                    f"IQR {q[0]:.1f}-{q[2]:.1f} min, mean {statistics.mean(times):.1f} min")
 
     header = f"{'':>14} | {'games':>5} | {'share':>6} | {'WR':>6} | {'95% CI':^17} |"
+    out.append("")
+    out.append("== Tier-2 boots as which item (completed items before boots + 1) ==")
+    out.append(header)
+    slots: dict[int, list[dict]] = defaultdict(list)
+    for r in built:
+        slots[r["boots_slot"]].append(r)
+    for slot in sorted(slots):
+        grp = slots[slot]
+        times = [g["boots_minute"] for g in grp]
+        out.append(fmt_row(grp[0]["boots_position"], len(grp), sum(g["win"] for g in grp), total)
+                   + f"  median {statistics.median(times):.1f} min")
+    if unbuilt:
+        out.append(fmt_row("not built", len(unbuilt), sum(g["win"] for g in unbuilt), total))
+
     out.append("")
     out.append(f"== Tier-2 boots completion time ({bucket_minutes}-min buckets) ==")
     out.append(header)
@@ -435,6 +510,10 @@ def export_json(rows: list[dict], path: Path, platform: str) -> None:
             "game_minutes": r["game_minutes"],
             "boots_minute": r["boots_minute"],
             "boots_item": r["boots_item"],
+            "boots_slot": r["boots_slot"],
+            "boots_position": r["boots_position"],
+            "items_before": r["items_before"],
+            "completed_items": r["completed_items"],
         })
     meta = [
         {"label": "graves_boots.py", "value": Path(__file__).read_text(), "type": "code", "lang": "python"},
@@ -474,7 +553,9 @@ def main() -> None:
     ap.add_argument("--rate", default="20/1,100/120",
                     help="app rate limits as count/seconds pairs (dev key default: 20/1,100/120)")
     ap.add_argument("--cache-dir", default=str(REPO_ROOT / ".riot_cache"))
-    ap.add_argument("--out", default="graves_boots", help="output prefix for the .csv and .txt files")
+    ap.add_argument("--out", default="graves_boots", help="output prefix for the .csv, .json and .txt files")
+    ap.add_argument("--from-cache", action="store_true",
+                    help="no API calls: analyse every Graves game already in the cache")
     args = ap.parse_args()
 
     platform = args.platform.lower()
@@ -484,17 +565,20 @@ def main() -> None:
     limits = [(int(c), float(s)) for c, s in (pair.split("/") for pair in args.rate.split(","))]
     cache_dir = Path(args.cache_dir) / platform
 
-    client = RiotClient(load_key(args.key), platform, region, limits, cache_dir)
-    boots = load_tier2_boots(cache_dir)
-
-    players = find_graves_players(client, [t.strip() for t in args.tiers.split(",") if t.strip()],
-                                  args.max_mastery_checks, args.graves_players, args.recent_days)
-    if not players:
-        sys.exit("No recent Graves players found; try more --max-mastery-checks or a larger --recent-days")
-    print(f"Using {len(players)} recent Graves players")
-
-    rows = collect(client, players, args.matches_per_player, args.days, boots, args.max_games,
-                   args.give_up_after)
+    boots, legendaries = load_items(cache_dir)
+    calls = 0
+    if args.from_cache:
+        rows = collect_from_cache(cache_dir, boots, legendaries)
+    else:
+        client = RiotClient(load_key(args.key), platform, region, limits, cache_dir)
+        players = find_graves_players(client, [t.strip() for t in args.tiers.split(",") if t.strip()],
+                                      args.max_mastery_checks, args.graves_players, args.recent_days)
+        if not players:
+            sys.exit("No recent Graves players found; try more --max-mastery-checks or a larger --recent-days")
+        print(f"Using {len(players)} recent Graves players")
+        rows = collect(client, players, args.matches_per_player, args.days, boots, legendaries,
+                       args.max_games, args.give_up_after)
+        calls = client.calls_made
     if not rows:
         sys.exit("No Graves games found in the scanned matches.")
 
@@ -510,7 +594,7 @@ def main() -> None:
     Path(f"{args.out}.txt").write_text(text + "\n")
     print()
     print(text)
-    print(f"\nPer-game rows: {csv_path}   report: {args.out}.txt   API calls: {client.calls_made}")
+    print(f"\nPer-game rows: {csv_path}   report: {args.out}.txt   API calls: {calls}")
 
 
 if __name__ == "__main__":
