@@ -26,7 +26,7 @@ src/main/java/riotkey.txt
 src/main/java/discordkey.txt
 # Riot API analysis cache/output
 .riot_cache/
-graves_boots.csv
-graves_boots.txt
-graves_boots.json
+graves_boots*.csv
+graves_boots*.txt
+graves_boots*.json
 __pycache__/
