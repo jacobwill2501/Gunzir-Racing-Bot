@@ -238,11 +238,13 @@ def find_graves_players(client: RiotClient, tiers: list[str], max_checks: int, w
             puuid = client.summoner_by_id(entry["summonerId"])["puuid"]
         mastery = client.graves_mastery(puuid)
         if mastery and mastery.get("lastPlayTime", 0) >= cutoff_ms:
-            candidates.append({"puuid": puuid, "points": mastery.get("championPoints", 0)})
+            candidates.append({"puuid": puuid, "points": mastery.get("championPoints", 0),
+                               "last_play": mastery.get("lastPlayTime", 0)})
         if i % 25 == 0 or i == len(ladder):
             print(f"  mastery checked {i}/{len(ladder)} -> {len(candidates)} recent Graves players")
 
-    candidates.sort(key=lambda c: c["points"], reverse=True)
+    # Most recently active on Graves first: lifetime points say little about current play.
+    candidates.sort(key=lambda c: (c["last_play"], c["points"]), reverse=True)
     return candidates[:want]
 
 
@@ -267,54 +269,67 @@ def first_tier2_boots(timeline: dict, participant_id: int, boots: dict[int, str]
     return purchases[0][0], purchases[0][1]
 
 
-def collect(client: RiotClient, players: list[dict], matches_per_player: int, days: int,
-            boots: dict[int, str], max_games: int) -> list[dict]:
-    start_time = int(time.time() - days * 86400) if days else None
-    match_ids: list[str] = []
-    seen = set()
-    for p in players:
-        for mid in client.match_ids(p["puuid"], matches_per_player, start_time):
-            if mid not in seen:
-                seen.add(mid)
-                match_ids.append(mid)
-    print(f"{len(match_ids)} unique ranked matches to scan")
-
+def graves_row(client: RiotClient, mid: str, boots: dict[int, str]) -> list[dict]:
+    """Rows for every Graves in one match (empty if none, or a remake)."""
+    info = client.match(mid)["info"]
+    if info.get("queueId") != RANKED_SOLO_QUEUE:
+        return []
+    duration_s = info.get("gameDuration", 0)
+    # Before patch 11.20 gameDuration was in ms.
+    if "gameEndTimestamp" not in info:
+        duration_s //= 1000
+    graves = [p for p in info["participants"] if p.get("championId") == GRAVES_ID]
+    if not graves:
+        return []
+    # Skip remakes.
+    if duration_s < 300 or any(p.get("gameEndedInEarlySurrender") for p in info["participants"]):
+        return []
+    timeline = client.timeline(mid)
     rows = []
-    for i, mid in enumerate(match_ids, 1):
+    for g in graves:
+        found = first_tier2_boots(timeline, g["participantId"], boots)
+        rows.append({
+            "match_id": mid,
+            "game_version": info.get("gameVersion", ""),
+            "game_start": info.get("gameStartTimestamp", 0),
+            "puuid": g["puuid"],
+            "riot_id": f"{g.get('riotIdGameName', '')}#{g.get('riotIdTagline', '')}",
+            "position": g.get("teamPosition", ""),
+            "win": bool(g["win"]),
+            "game_minutes": round(duration_s / 60, 2),
+            "boots_minute": round(found[0] / 60000, 2) if found else None,
+            "boots_item": boots.get(found[1], str(found[1])) if found else "None",
+        })
+    return rows
+
+
+def collect(client: RiotClient, players: list[dict], matches_per_player: int, days: int,
+            boots: dict[int, str], max_games: int, give_up_after: int) -> list[dict]:
+    """Scan each seed player's recent ranked games. A seed with no Graves game in their
+    first `give_up_after` matches is skipped, since they aren't playing him now."""
+    start_time = int(time.time() - days * 86400) if days else None
+    seen: set[str] = set()
+    rows: list[dict] = []
+    scanned = 0
+    for n, p in enumerate(players, 1):
         if max_games and len(rows) >= max_games:
             break
-        if i % 50 == 0:
-            print(f"  scanned {i}/{len(match_ids)} matches, {len(rows)} Graves games, "
-                  f"{client.calls_made} API calls")
-        match = client.match(mid)
-        info = match["info"]
-        if info.get("queueId") != RANKED_SOLO_QUEUE:
-            continue
-        duration_s = info.get("gameDuration", 0)
-        # Before patch 11.20 gameDuration was in ms.
-        if "gameEndTimestamp" not in info:
-            duration_s //= 1000
-        graves = [p for p in info["participants"] if p.get("championId") == GRAVES_ID]
-        if not graves:
-            continue
-        # Skip remakes.
-        if duration_s < 300 or any(p.get("gameEndedInEarlySurrender") for p in info["participants"]):
-            continue
-        timeline = client.timeline(mid)
-        for g in graves:
-            found = first_tier2_boots(timeline, g["participantId"], boots)
-            rows.append({
-                "match_id": mid,
-                "game_version": info.get("gameVersion", ""),
-                "game_start": info.get("gameStartTimestamp", 0),
-                "puuid": g["puuid"],
-                "riot_id": f"{g.get('riotIdGameName', '')}#{g.get('riotIdTagline', '')}",
-                "position": g.get("teamPosition", ""),
-                "win": bool(g["win"]),
-                "game_minutes": round(duration_s / 60, 2),
-                "boots_minute": round(found[0] / 60000, 2) if found else None,
-                "boots_item": boots.get(found[1], str(found[1])) if found else "None",
-            })
+        seed_graves = 0
+        ids = client.match_ids(p["puuid"], matches_per_player, start_time)
+        for k, mid in enumerate(ids, 1):
+            if give_up_after and k > give_up_after and seed_graves == 0:
+                break
+            if mid in seen:
+                # Already counted; still note whether this seed was the Graves.
+                seed_graves += any(r["match_id"] == mid and r["puuid"] == p["puuid"] for r in rows)
+                continue
+            seen.add(mid)
+            scanned += 1
+            new_rows = graves_row(client, mid, boots)
+            rows.extend(new_rows)
+            seed_graves += any(r["puuid"] == p["puuid"] for r in new_rows)
+        print(f"  player {n}/{len(players)}: {seed_graves} own Graves games | total {len(rows)} Graves games, "
+              f"{scanned} matches scanned, {client.calls_made} API calls")
     return rows
 
 
@@ -452,6 +467,8 @@ def main() -> None:
                     help="seed players must have played Graves within this many days")
     ap.add_argument("--matches-per-player", type=int, default=20, help="ranked match IDs per player (max 100)")
     ap.add_argument("--days", type=int, default=30, help="only matches from the last N days (0 = no limit)")
+    ap.add_argument("--give-up-after", type=int, default=10,
+                    help="skip a seed player with no Graves game in their first N matches (0 = never)")
     ap.add_argument("--max-games", type=int, default=0, help="stop after this many Graves games (0 = no limit)")
     ap.add_argument("--bucket", type=int, default=1, help="bucket width in minutes for the distribution")
     ap.add_argument("--rate", default="20/1,100/120",
@@ -474,9 +491,10 @@ def main() -> None:
                                   args.max_mastery_checks, args.graves_players, args.recent_days)
     if not players:
         sys.exit("No recent Graves players found; try more --max-mastery-checks or a larger --recent-days")
-    print(f"Using {len(players)} Graves players (top mastery: {players[0]['points']:,} pts)")
+    print(f"Using {len(players)} recent Graves players")
 
-    rows = collect(client, players, args.matches_per_player, args.days, boots, args.max_games)
+    rows = collect(client, players, args.matches_per_player, args.days, boots, args.max_games,
+                   args.give_up_after)
     if not rows:
         sys.exit("No Graves games found in the scanned matches.")
 
