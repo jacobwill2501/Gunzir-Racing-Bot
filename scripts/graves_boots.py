@@ -283,6 +283,9 @@ def collect(client: RiotClient, players: list[dict], matches_per_player: int, da
     for i, mid in enumerate(match_ids, 1):
         if max_games and len(rows) >= max_games:
             break
+        if i % 50 == 0:
+            print(f"  scanned {i}/{len(match_ids)} matches, {len(rows)} Graves games, "
+                  f"{client.calls_made} API calls")
         match = client.match(mid)
         info = match["info"]
         if info.get("queueId") != RANKED_SOLO_QUEUE:
@@ -312,9 +315,6 @@ def collect(client: RiotClient, players: list[dict], matches_per_player: int, da
                 "boots_minute": round(found[0] / 60000, 2) if found else None,
                 "boots_item": boots.get(found[1], str(found[1])) if found else "None",
             })
-        if i % 20 == 0:
-            print(f"  scanned {i}/{len(match_ids)} matches, {len(rows)} Graves games, "
-                  f"{client.calls_made} API calls")
     return rows
 
 
@@ -403,6 +403,32 @@ def report(rows: list[dict], bucket_minutes: int) -> str:
 
 # --------------------------------------------------------------------------- #
 
+def export_json(rows: list[dict], path: Path, platform: str) -> None:
+    """Dashboard export: player identities replaced by P1, P2, ... and the script kept as meta."""
+    ids: dict[str, str] = {}
+    out = []
+    for r in rows:
+        player = ids.setdefault(r["puuid"], f"P{len(ids) + 1}")
+        major_minor = ".".join(r["game_version"].split(".")[:2])
+        out.append({
+            "match_id": r["match_id"],
+            "patch": major_minor,
+            "date": time.strftime("%Y-%m-%d", time.gmtime(r["game_start"] / 1000)) if r["game_start"] else None,
+            "player": player,
+            "position": r["position"] or "UNKNOWN",
+            "win": r["win"],
+            "game_minutes": r["game_minutes"],
+            "boots_minute": r["boots_minute"],
+            "boots_item": r["boots_item"],
+        })
+    meta = [
+        {"label": "graves_boots.py", "value": Path(__file__).read_text(), "type": "code", "lang": "python"},
+        {"label": "Input", "value": f"Riot API ({platform}): apex ladder, Graves mastery, match-v5 matches and timelines"},
+        {"label": "Pulled", "value": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())},
+    ]
+    path.write_text(json.dumps({"rows": out, "meta": meta}))
+
+
 def load_key(cli_key: str | None) -> str:
     key = cli_key or os.environ.get("RIOT_API_KEY")
     if not key and DEFAULT_KEY_FILE.exists():
@@ -459,6 +485,8 @@ def main() -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+    export_json(rows, Path(f"{args.out}.json"), platform)
 
     text = report(rows, args.bucket)
     Path(f"{args.out}.txt").write_text(text + "\n")
