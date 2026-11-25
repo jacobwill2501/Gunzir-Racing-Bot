@@ -35,8 +35,10 @@ import math
 import os
 import statistics
 import sys
+import threading
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -64,6 +66,12 @@ FALLBACK_TIER2_BOOTS = {
     3158: "Ionian Boots of Lucidity",
 }
 
+ALL_PLATFORMS = ["na1", "br1", "la1", "la2", "euw1", "eun1", "tr1", "ru", "me1",
+                 "kr", "jp1", "oc1", "sg2", "tw2", "vn2"]
+SERVER_NAMES = {"na1": "NA", "br1": "BR", "la1": "LAN", "la2": "LAS", "euw1": "EUW", "eun1": "EUNE",
+                "tr1": "TR", "ru": "RU", "me1": "ME", "kr": "KR", "jp1": "JP", "oc1": "OCE",
+                "sg2": "SEA", "tw2": "TW", "vn2": "VN", "ph2": "PH", "th2": "TH"}
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_KEY_FILE = REPO_ROOT / "src" / "main" / "java" / "riotkey.txt"
 
@@ -78,33 +86,56 @@ class RateLimiter:
     def __init__(self, limits: list[tuple[int, float]]):
         self.limits = limits
         self.calls: deque[float] = deque()
+        self.lock = threading.Lock()  # several platform threads share one regional host
 
     def wait(self) -> None:
         while True:
-            now = time.monotonic()
-            longest = max(w for _, w in self.limits)
-            while self.calls and now - self.calls[0] > longest:
-                self.calls.popleft()
-            sleep_for = 0.0
-            for count, window in self.limits:
-                in_window = [t for t in self.calls if now - t < window]
-                if len(in_window) >= count:
-                    sleep_for = max(sleep_for, window - (now - in_window[0]) + 0.05)
-            if sleep_for <= 0:
-                self.calls.append(now)
-                return
+            with self.lock:
+                now = time.monotonic()
+                longest = max(w for _, w in self.limits)
+                while self.calls and now - self.calls[0] > longest:
+                    self.calls.popleft()
+                sleep_for = 0.0
+                for count, window in self.limits:
+                    in_window = [t for t in self.calls if now - t < window]
+                    if len(in_window) >= count:
+                        sleep_for = max(sleep_for, window - (now - in_window[0]) + 0.05)
+                if sleep_for <= 0:
+                    self.calls.append(now)
+                    return
             time.sleep(sleep_for)
 
 
+class LimiterRegistry:
+    """One limiter per host. Riot app rate limits apply per routing value (na1, euw1,
+    americas, europe, ...), so different hosts run fully in parallel."""
+
+    def __init__(self, limits: list[tuple[int, float]]):
+        self.limits = limits
+        self.by_host: dict[str, RateLimiter] = {}
+        self.lock = threading.Lock()
+
+    def get(self, host: str) -> RateLimiter:
+        with self.lock:
+            if host not in self.by_host:
+                self.by_host[host] = RateLimiter(self.limits)
+            return self.by_host[host]
+
+
+class AuthError(RuntimeError):
+    pass
+
+
 class RiotClient:
-    def __init__(self, key: str, platform: str, region: str, limits: list[tuple[int, float]],
+    def __init__(self, key: str, platform: str, region: str, limiters: LimiterRegistry,
                  cache_dir: Path):
         self.session = requests.Session()
         self.session.headers["X-Riot-Token"] = key
+        self.platform = platform
         self.platform_host = f"https://{platform}.api.riotgames.com"
         self.region_host = f"https://{region}.api.riotgames.com"
-        # Riot app rate limits are enforced per routing value, so one limiter per host.
-        self.limiters = {self.platform_host: RateLimiter(limits), self.region_host: RateLimiter(limits)}
+        self.limiters = {self.platform_host: limiters.get(self.platform_host),
+                         self.region_host: limiters.get(self.region_host)}
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.calls_made = 0
@@ -115,6 +146,9 @@ class RiotClient:
             self.limiters[host].wait()
             try:
                 resp = self.session.get(url, params=params, timeout=30)
+            except requests.exceptions.ProxyError as exc:
+                # The network proxy refused the host: not allowed, or no key saved for it.
+                raise AuthError(f"{host} is blocked by the network proxy ({exc})") from exc
             except requests.RequestException as exc:
                 wait = 2 ** attempt
                 print(f"  network error ({exc}); retrying in {wait}s", file=sys.stderr)
@@ -127,15 +161,15 @@ class RiotClient:
                 return None
             if resp.status_code == 429:
                 wait = int(resp.headers.get("Retry-After", "10"))
-                print(f"  rate limited (429); sleeping {wait}s", file=sys.stderr)
+                print(f"  [{self.platform}] rate limited (429) on {host}; sleeping {wait}s", file=sys.stderr)
                 time.sleep(wait)
                 continue
             if resp.status_code in (500, 502, 503, 504):
                 time.sleep(2 ** attempt)
                 continue
             if resp.status_code in (401, 403):
-                sys.exit(f"Riot API returned {resp.status_code} for {path}. "
-                         "The API key is missing, invalid, or expired (dev keys last 24h).")
+                raise AuthError(f"Riot API returned {resp.status_code} for {host}{path}. "
+                                "The API key is missing, invalid, or expired (dev keys last 24h).")
             raise RuntimeError(f"GET {url} -> {resp.status_code}: {resp.text[:200]}")
         raise RuntimeError(f"GET {url} failed after retries")
 
@@ -235,11 +269,12 @@ def load_items(cache_dir: Path) -> tuple[dict[int, str], dict[int, str]]:
 
 def find_graves_players(client: RiotClient, tiers: list[str], max_checks: int, want: int,
                         recent_days: int) -> list[dict]:
+    tag = f"[{client.platform}]"
     ladder = []
     for tier in tiers:
         league = client.apex_league(tier)
         entries = league.get("entries", [])
-        print(f"{tier.title()}: {len(entries)} players")
+        print(f"{tag} {tier.title()}: {len(entries)} players")
         ladder.extend(entries)
     ladder.sort(key=lambda e: e.get("leaguePoints", 0), reverse=True)
     ladder = ladder[:max_checks]
@@ -254,8 +289,8 @@ def find_graves_players(client: RiotClient, tiers: list[str], max_checks: int, w
         if mastery and mastery.get("lastPlayTime", 0) >= cutoff_ms:
             candidates.append({"puuid": puuid, "points": mastery.get("championPoints", 0),
                                "last_play": mastery.get("lastPlayTime", 0)})
-        if i % 25 == 0 or i == len(ladder):
-            print(f"  mastery checked {i}/{len(ladder)} -> {len(candidates)} recent Graves players")
+        if i % 100 == 0 or i == len(ladder):
+            print(f"{tag} mastery checked {i}/{len(ladder)} -> {len(candidates)} recent Graves players")
 
     # Most recently active on Graves first: lifetime points say little about current play.
     candidates.sort(key=lambda c: (c["last_play"], c["points"]), reverse=True)
@@ -342,6 +377,7 @@ def graves_row(client: "RiotClient | None", mid: str, boots: dict[int, str], leg
         order = build_order(timeline, g["participantId"], boots, legendaries)
         rows.append({
             "match_id": mid,
+            "platform": str(info.get("platformId", mid.split("_")[0])).lower(),
             "game_version": info.get("gameVersion", ""),
             "game_start": info.get("gameStartTimestamp", 0),
             "puuid": g["puuid"],
@@ -380,17 +416,28 @@ def collect(client: RiotClient, players: list[dict], matches_per_player: int, da
             new_rows = graves_row(client, mid, boots, legendaries)
             rows.extend(new_rows)
             seed_graves += any(r["puuid"] == p["puuid"] for r in new_rows)
-        print(f"  player {n}/{len(players)}: {seed_graves} own Graves games | total {len(rows)} Graves games, "
+        print(f"[{client.platform}] player {n}/{len(players)}: {seed_graves} own Graves games | total {len(rows)} Graves games, "
               f"{scanned} matches scanned, {client.calls_made} API calls")
     return rows
 
 
-def collect_from_cache(cache_dir: Path, boots: dict[int, str], legendaries: dict[int, str]) -> list[dict]:
-    """Every cached ranked match with a Graves and a cached timeline. No API calls."""
+def collect_from_cache(cache_root: Path, platforms: list[str], boots: dict[int, str],
+                       legendaries: dict[int, str], days: int) -> list[dict]:
+    """Every cached ranked match with a Graves and a cached timeline, from the given
+    platforms and (if days) the last `days` days. No API calls."""
+    cutoff_ms = (time.time() - days * 86400) * 1000 if days else 0
     rows = []
-    for path in sorted((cache_dir / "match").glob("*.json")):
-        rows.extend(graves_row(None, path.stem, boots, legendaries, cache_dir))
-    print(f"{len(rows)} Graves games in the cache")
+    for platform in platforms:
+        cache_dir = cache_root / platform
+        for path in sorted((cache_dir / "match").glob("*.json")):
+            for r in graves_row(None, path.stem, boots, legendaries, cache_dir):
+                if r["game_start"] >= cutoff_ms:
+                    rows.append(r)
+    by_platform = defaultdict(int)
+    for r in rows:
+        by_platform[r["platform"]] += 1
+    print(f"{len(rows)} Graves games in the cache: " +
+          ", ".join(f"{SERVER_NAMES.get(p, p)} {n}" for p, n in sorted(by_platform.items(), key=lambda kv: -kv[1])))
     return rows
 
 
@@ -502,6 +549,7 @@ def export_json(rows: list[dict], path: Path, platform: str) -> None:
         major_minor = ".".join(r["game_version"].split(".")[:2])
         out.append({
             "match_id": r["match_id"],
+            "server": SERVER_NAMES.get(r.get("platform", ""), r.get("platform", "").upper()),
             "patch": major_minor,
             "date": time.strftime("%Y-%m-%d", time.gmtime(r["game_start"] / 1000)) if r["game_start"] else None,
             "player": player,
@@ -518,6 +566,7 @@ def export_json(rows: list[dict], path: Path, platform: str) -> None:
     meta = [
         {"label": "graves_boots.py", "value": Path(__file__).read_text(), "type": "code", "lang": "python"},
         {"label": "Input", "value": f"Riot API ({platform}): apex ladder, Graves mastery, match-v5 matches and timelines"},
+        {"label": "Servers", "value": ", ".join(sorted({SERVER_NAMES.get(r.get("platform", ""), r.get("platform", "")) for r in rows}))},
         {"label": "Pulled", "value": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())},
     ]
     path.write_text(json.dumps({"rows": out, "meta": meta}))
@@ -535,7 +584,8 @@ def load_key(cli_key: str | None) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--key", help="Riot API key (default: $RIOT_API_KEY or src/main/java/riotkey.txt)")
-    ap.add_argument("--platform", default="na1", help="platform routing value (default na1)")
+    ap.add_argument("--platforms", "--platform", default="na1",
+                    help="comma-separated platforms (na1,euw1,kr,...) or 'all' for every server (default na1)")
     ap.add_argument("--tiers", default="challenger,grandmaster,master",
                     help="apex tiers to seed players from")
     ap.add_argument("--max-mastery-checks", type=int, default=300,
@@ -558,29 +608,53 @@ def main() -> None:
                     help="no API calls: analyse every Graves game already in the cache")
     args = ap.parse_args()
 
-    platform = args.platform.lower()
-    region = PLATFORM_TO_REGION.get(platform)
-    if not region:
-        sys.exit(f"Unknown platform '{platform}'. Known: {', '.join(PLATFORM_TO_REGION)}")
+    platforms = ALL_PLATFORMS if args.platforms.lower() == "all" else \
+        [p.strip().lower() for p in args.platforms.split(",") if p.strip()]
+    unknown = [p for p in platforms if p not in PLATFORM_TO_REGION]
+    if unknown:
+        sys.exit(f"Unknown platform(s) {unknown}. Known: {', '.join(PLATFORM_TO_REGION)}")
     limits = [(int(c), float(s)) for c, s in (pair.split("/") for pair in args.rate.split(","))]
-    cache_dir = Path(args.cache_dir) / platform
+    cache_root = Path(args.cache_dir)
 
-    boots, legendaries = load_items(cache_dir)
+    boots, legendaries = load_items(cache_root)
+    tiers = [t.strip() for t in args.tiers.split(",") if t.strip()]
     calls = 0
-    if args.from_cache:
-        rows = collect_from_cache(cache_dir, boots, legendaries)
-    else:
-        client = RiotClient(load_key(args.key), platform, region, limits, cache_dir)
-        players = find_graves_players(client, [t.strip() for t in args.tiers.split(",") if t.strip()],
-                                      args.max_mastery_checks, args.graves_players, args.recent_days)
-        if not players:
-            sys.exit("No recent Graves players found; try more --max-mastery-checks or a larger --recent-days")
-        print(f"Using {len(players)} recent Graves players")
-        rows = collect(client, players, args.matches_per_player, args.days, boots, legendaries,
-                       args.max_games, args.give_up_after)
-        calls = client.calls_made
+    if not args.from_cache:
+        key = load_key(args.key)
+        registry = LimiterRegistry(limits)
+
+        def run_platform(platform: str) -> tuple[str, int, int]:
+            client = RiotClient(key, platform, PLATFORM_TO_REGION[platform], registry, cache_root / platform)
+            players = find_graves_players(client, tiers, args.max_mastery_checks, args.graves_players,
+                                          args.recent_days)
+            print(f"[{platform}] using {len(players)} recent Graves players")
+            found = collect(client, players, args.matches_per_player, args.days, boots, legendaries,
+                            args.max_games, args.give_up_after) if players else []
+            return platform, len(found), client.calls_made
+
+        # One thread per platform. Platforms in the same region share that region's
+        # match-v5 limiter; every other host runs at its own full rate.
+        failed = []
+        with ThreadPoolExecutor(max_workers=len(platforms)) as pool:
+            futures = {pool.submit(run_platform, p): p for p in platforms}
+            for fut in as_completed(futures):
+                platform = futures[fut]
+                try:
+                    _, n, c = fut.result()
+                    calls += c
+                    print(f"[{platform}] done: {n} Graves games, {c} API calls")
+                except Exception as exc:  # one server failing shouldn't stop the others
+                    failed.append(platform)
+                    print(f"[{platform}] FAILED: {exc}", file=sys.stderr)
+        if failed:
+            print(f"Servers that failed: {', '.join(failed)}", file=sys.stderr)
+
+    # The output is everything cached for these servers in the window, so games from
+    # earlier runs count too.
+    rows = collect_from_cache(cache_root, platforms, boots, legendaries, args.days)
     if not rows:
-        sys.exit("No Graves games found in the scanned matches.")
+        sys.exit("No Graves games found.")
+    platform = ",".join(platforms)
 
     csv_path = Path(f"{args.out}.csv")
     with csv_path.open("w", newline="") as f:
